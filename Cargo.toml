@@ -12,11 +12,11 @@ categories = ["command-line-utilities", "encoding"]
 
 [dependencies]
 base64 = "0.22.1"
-clap = { version = "4.5.4", features = ["derive"] }
-docx-rust = "0.1.8"
+clap = { version = "4.5.26", features = ["derive"] }
+docx-rust = "0.1.9"
 # docx-rust = { git = "https://github.com/erikvullings/docx-rs.git" }
-serde = { version = "1.0.202", features = ["derive"] }
-serde_json = "1.0.117"
+serde = { version = "1.0.217", features = ["derive"] }
+serde_json = "1.0.135"
 
 [[bin]]
 name = "docx-parser"
