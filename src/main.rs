@@ -69,13 +69,13 @@ fn main() {
     println!("Output destination: {}", output);
     println!("Output format: {}", format);
 
-    let markdown_doc = MarkdownDocument::from_file(input_file);
+    let markdown_doc = MarkdownDocument::from_file(input_file).unwrap();
     let result = if format == "md" {
         markdown_doc.to_markdown(true)
     } else if format == "json" {
-        markdown_doc.to_json(false)
+        markdown_doc.to_json(false).unwrap()
     } else {
-        markdown_doc.to_json(true)
+        markdown_doc.to_json(true).unwrap()
     };
     if output == "console" {
         println!("{result}");

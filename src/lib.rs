@@ -14,15 +14,17 @@
 
 mod utils;
 
-use docx_rust::document::BodyContent::{Paragraph, Sdt, SectionProperty, Table, TableCell};
+use docx_rust::core::Core;
+use docx_rust::document::BodyContent::{Paragraph, Run, Sdt, SectionProperty, Table, TableCell};
 use docx_rust::document::{ParagraphContent, RunContent, TableCellContent, TableRowContent};
 use docx_rust::formatting::{NumberFormat, OnOffOnlyType, ParagraphProperty};
 use docx_rust::media::MediaType;
 use docx_rust::styles::StyleType;
 use docx_rust::DocxFile;
 use serde::Serialize;
-use serde_json;
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::{Read, Seek};
 use std::path::Path;
 use std::str::FromStr;
 use utils::{max_lengths_per_column, save_image_to_file, serialize_images, table_row_to_markdown};
@@ -67,7 +69,6 @@ impl BlockStyle {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-
 pub struct MarkdownNumbering {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<isize>,
@@ -107,8 +108,8 @@ impl ParagraphStyle {
 
     pub fn combine_with(&mut self, other: &ParagraphStyle) {
         self.style_id = self.style_id.clone().or_else(|| other.style_id.clone());
-        self.outline_lvl = self.outline_lvl.or_else(|| other.outline_lvl);
-        self.page_break_before = self.page_break_before.or_else(|| other.page_break_before);
+        self.outline_lvl = self.outline_lvl.or(other.outline_lvl);
+        self.page_break_before = self.page_break_before.or(other.page_break_before);
         if self.numbering.is_none() {
             self.numbering = other.numbering.clone()
         }
@@ -143,7 +144,7 @@ impl<'a> From<&'a ParagraphProperty<'a>> for ParagraphStyle {
                 level_text: None,
             });
         }
-        if paragraph_property.r_pr.len() > 0 {
+        if !paragraph_property.r_pr.is_empty() {
             let mut block_style = BlockStyle::new();
             paragraph_property
                 .r_pr
@@ -392,8 +393,12 @@ impl MarkdownParagraph {
                             }
                             RunContent::Drawing(drawing) => {
                                 if let Some(inline) = &drawing.inline {
-                                    if let Some(graphic) = &inline.graphic {
-                                        let id = graphic.data.pic.fill.blip.embed.to_string();
+                                    if let Some(graphic) = &inline
+                                        .graphic
+                                        .as_ref()
+                                        .and_then(|g| g.data.children.first())
+                                    {
+                                        let id = graphic.fill.blip.embed.to_string();
                                         if let Some(relationships) = &docx.document_rels {
                                             if let Some(target) = relationships.get_target(&id) {
                                                 let descr = match &inline.doc_property.descr {
@@ -415,9 +420,9 @@ impl MarkdownParagraph {
                     }
                 }
                 ParagraphContent::Link(link) => {
-                    let descr = link.content.content.first();
+                    let descr = link.content.as_ref().and_then(|r| r.content.first());
                     let target = match &link.anchor {
-                        Some(anchor) => Some(format!("#{}", anchor.to_string())),
+                        Some(anchor) => Some(format!("#{}", anchor)),
                         None => match &link.id {
                             Some(id) => match &docx.document_rels {
                                 Some(doc_relationships) => {
@@ -458,19 +463,7 @@ impl MarkdownParagraph {
 #[serde(rename_all = "camelCase")]
 pub struct MarkdownDocument {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub creator: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_editor: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub company: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub subject: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub keywords: Option<String>,
     pub content: Vec<MarkdownContent>,
     pub styles: HashMap<String, ParagraphStyle>,
     pub numberings: HashMap<isize, MarkdownNumbering>,
@@ -481,13 +474,7 @@ pub struct MarkdownDocument {
 impl MarkdownDocument {
     pub fn new() -> Self {
         MarkdownDocument {
-            creator: None,
-            last_editor: None,
-            company: None,
             title: None,
-            description: None,
-            subject: None,
-            keywords: None,
             content: vec![],
             styles: HashMap::new(),
             numberings: HashMap::new(),
@@ -495,61 +482,24 @@ impl MarkdownDocument {
         }
     }
 
-    pub fn from_file<P: AsRef<Path>>(path: P) -> Self {
+    pub fn from_file<P: AsRef<Path>>(path: P) -> Option<Self> {
+        let file = File::open(path).ok()?;
+        Self::from_reader(file)
+    }
+
+    pub fn from_reader<T: Read + Seek>(reader: T) -> Option<Self> {
         let mut markdown_doc = MarkdownDocument::new();
 
-        let docx = match DocxFile::from_file(path) {
-            Ok(docx_file) => docx_file,
-            Err(err) => {
-                panic!("Error processing file: {:?}", err)
-            }
-        };
-        let docx = match docx.parse() {
-            Ok(docx) => docx,
-            Err(err) => {
-                panic!("Exiting: {:?}", err);
-            }
-        };
-
-        // println!("{:?}", &docx);
-
-        if let Some(app) = &docx.app {
-            if let Some(company) = &app.company {
-                if !company.is_empty() {
-                    markdown_doc.company = Some(company.to_string());
-                }
-            }
-        }
+        let docx = DocxFile::from_reader(reader).ok()?;
+        let docx = docx.parse().ok()?;
 
         if let Some(core) = &docx.core {
-            if let Some(title) = &core.title {
+            if let Some(title) = match core {
+                Core::CoreNamespace(core) => &core.title,
+                Core::CoreNoNamespace(core) => &core.title,
+            } {
                 if !title.is_empty() {
                     markdown_doc.title = Some(title.to_string());
-                }
-            }
-            if let Some(subject) = &core.subject {
-                if !subject.is_empty() {
-                    markdown_doc.subject = Some(subject.to_string());
-                }
-            }
-            if let Some(keywords) = &core.keywords {
-                if !keywords.is_empty() {
-                    markdown_doc.keywords = Some(keywords.to_string());
-                }
-            }
-            if let Some(description) = &core.description {
-                if !description.is_empty() {
-                    markdown_doc.description = Some(description.to_string());
-                }
-            }
-            if let Some(creator) = &core.creator {
-                if !creator.is_empty() {
-                    markdown_doc.creator = Some(creator.to_string());
-                }
-            }
-            if let Some(last_modified_by) = &core.last_modified_by {
-                if !last_modified_by.is_empty() {
-                    markdown_doc.last_editor = Some(last_modified_by.to_string());
                 }
             }
         }
@@ -573,7 +523,6 @@ impl MarkdownDocument {
                                     .map(|i| i.value.to_string()),
                             },
                         );
-                        ()
                     }
                 }
             })
@@ -584,24 +533,21 @@ impl MarkdownDocument {
         }
 
         for style in &docx.styles.styles {
-            match style.ty {
-                Some(StyleType::Paragraph) => {
-                    if let Some(paragraph_property) = &style.paragraph {
-                        let paragraph_style: ParagraphStyle = paragraph_property.into();
-                        markdown_doc
-                            .styles
-                            .insert(style.style_id.to_string(), paragraph_style);
-                    }
+            if let Some(StyleType::Paragraph) = style.ty {
+                if let Some(paragraph_property) = &style.paragraph {
+                    let paragraph_style: ParagraphStyle = paragraph_property.into();
+                    markdown_doc
+                        .styles
+                        .insert(style.style_id.to_string(), paragraph_style);
                 }
-                _ => (),
             }
         }
 
         for content in &docx.document.body.content {
             match content {
                 Paragraph(paragraph) => {
-                    let markdown_paragraph = MarkdownParagraph::from_paragraph(&paragraph, &docx);
-                    if markdown_paragraph.blocks.len() > 0 {
+                    let markdown_paragraph = MarkdownParagraph::from_paragraph(paragraph, &docx);
+                    if !markdown_paragraph.blocks.is_empty() {
                         markdown_doc
                             .content
                             .push(MarkdownContent::Paragraph(markdown_paragraph));
@@ -613,10 +559,9 @@ impl MarkdownDocument {
                         .iter()
                         .map(|row| {
                             let is_header = match &row.property.table_header {
-                                Some(table_header) => match table_header.value {
-                                    Some(OnOffOnlyType::On) => true,
-                                    _ => false,
-                                },
+                                Some(table_header) => {
+                                    matches!(table_header.value, Some(OnOffOnlyType::On))
+                                }
                                 None => false,
                             };
                             let cells: Vec<Vec<MarkdownParagraph>> = row
@@ -630,12 +575,12 @@ impl MarkdownDocument {
                                             .filter_map(|content| match content {
                                                 TableCellContent::Paragraph(paragraph) => {
                                                     Some(MarkdownParagraph::from_paragraph(
-                                                        &paragraph, &docx,
+                                                        paragraph, &docx,
                                                     ))
                                                 } // _ => None,
                                             })
                                             .collect();
-                                        if cells.len() > 0 {
+                                        if !cells.is_empty() {
                                             Some(cells)
                                         } else {
                                             None
@@ -658,20 +603,23 @@ impl MarkdownDocument {
                 SectionProperty(_sp) => {
                     // println!("SectionProperty: {:?}", sp);
                 }
-                TableCell(tc) => {
-                    println!("TableCell: {:?}", tc);
+                TableCell(_tc) => {
+                    // println!("TableCell: {:?}", tc);
+                }
+                Run(_run) => {
+                    // println!("Run: {:?}", run);
                 }
             }
         }
 
-        markdown_doc
+        Some(markdown_doc)
     }
 
-    pub fn to_json(&self, pretty: bool) -> String {
+    pub fn to_json(&self, pretty: bool) -> Option<String> {
         if pretty {
-            serde_json::to_string_pretty(self).expect("Serialization failed")
+            serde_json::to_string_pretty(self).ok()
         } else {
-            serde_json::to_string(self).expect("Serialization failed")
+            serde_json::to_string(self).ok()
         }
     }
 
@@ -687,7 +635,7 @@ impl MarkdownDocument {
         for (index, content) in self.content.iter().enumerate() {
             match content {
                 MarkdownContent::Paragraph(paragraph) => {
-                    markdown += &paragraph.to_markdown(&self.styles, &mut numberings, &self);
+                    markdown += &paragraph.to_markdown(&self.styles, &mut numberings, self);
                     markdown += "\n";
                 }
                 MarkdownContent::Table(table) => {
@@ -703,7 +651,7 @@ impl MarkdownDocument {
                                             let paragraph_as_markdown = &paragraph.to_markdown(
                                                 &self.styles,
                                                 &mut numberings,
-                                                &self,
+                                                self,
                                             );
                                             if i + 1 < cell.len() {
                                                 content +=
@@ -717,7 +665,7 @@ impl MarkdownDocument {
                                     cell_content.clone()
                                 })
                                 .collect();
-                            (is_header.clone(), row_content.clone())
+                            (*is_header, row_content.clone())
                         })
                         .collect();
                     let column_lengths = max_lengths_per_column(&table_with_simple_cells, 3);
@@ -745,7 +693,7 @@ impl MarkdownDocument {
                                 acc.push_str(markdown_row);
                             }
                             if i == table_with_simple_cells.len() {
-                                acc.push_str("\n");
+                                acc.push('\n');
                             }
                             acc
                         },
@@ -799,7 +747,7 @@ mod tests {
     #[test]
     fn test_headers() {
         let markdown_pandoc = fs::read_to_string("./test/headers.md").unwrap();
-        let markdown_doc = MarkdownDocument::from_file("./test/headers.docx");
+        let markdown_doc = MarkdownDocument::from_file("./test/headers.docx").unwrap();
         let markdown = markdown_doc.to_markdown(false);
         assert_eq!(markdown_pandoc, markdown);
     }
@@ -807,7 +755,7 @@ mod tests {
     #[test]
     fn test_bullets() {
         let markdown_pandoc = fs::read_to_string("./test/lists.md").unwrap();
-        let markdown_doc = MarkdownDocument::from_file("./test/lists.docx");
+        let markdown_doc = MarkdownDocument::from_file("./test/lists.docx").unwrap();
         let markdown = markdown_doc.to_markdown(false);
         assert_eq!(markdown_pandoc, markdown);
     }
@@ -815,7 +763,7 @@ mod tests {
     #[test]
     fn test_images() {
         let markdown_pandoc = fs::read_to_string("./test/image.md").unwrap();
-        let markdown_doc = MarkdownDocument::from_file("./test/image.docx");
+        let markdown_doc = MarkdownDocument::from_file("./test/image.docx").unwrap();
         let markdown = markdown_doc.to_markdown(false);
         assert_eq!(markdown_pandoc, markdown);
     }
@@ -823,7 +771,7 @@ mod tests {
     #[test]
     fn test_links() {
         let markdown_pandoc = fs::read_to_string("./test/links.md").unwrap();
-        let markdown_doc = MarkdownDocument::from_file("./test/links.docx");
+        let markdown_doc = MarkdownDocument::from_file("./test/links.docx").unwrap();
         let markdown = markdown_doc.to_markdown(false);
         assert_eq!(markdown_pandoc, markdown);
     }
@@ -831,7 +779,7 @@ mod tests {
     #[test]
     fn test_tables() {
         let markdown_pandoc = fs::read_to_string("./test/tables.md").unwrap();
-        let markdown_doc = MarkdownDocument::from_file("./test/tables.docx");
+        let markdown_doc = MarkdownDocument::from_file("./test/tables.docx").unwrap();
         let markdown = markdown_doc.to_markdown(false);
         assert_eq!(markdown_pandoc, markdown);
     }
@@ -839,7 +787,7 @@ mod tests {
     #[test]
     fn test_one_row_table() {
         let markdown_pandoc = fs::read_to_string("./test/table_one_row.md").unwrap();
-        let markdown_doc = MarkdownDocument::from_file("./test/table_one_row.docx");
+        let markdown_doc = MarkdownDocument::from_file("./test/table_one_row.docx").unwrap();
         let markdown = markdown_doc.to_markdown(false);
         assert_eq!(markdown_pandoc, markdown);
     }
@@ -847,7 +795,7 @@ mod tests {
     #[test]
     fn test_table_with_list_cell() {
         let markdown_pandoc = fs::read_to_string("./test/table_with_list_cell.md").unwrap();
-        let markdown_doc = MarkdownDocument::from_file("./test/table_with_list_cell.docx");
+        let markdown_doc = MarkdownDocument::from_file("./test/table_with_list_cell.docx").unwrap();
         let markdown = markdown_doc.to_markdown(false);
         assert_eq!(markdown_pandoc, markdown);
     }
@@ -857,7 +805,7 @@ mod tests {
         let markdown_pandoc =
             fs::read_to_string("./test/tables_separated_with_rawblock.md").unwrap();
         let markdown_doc =
-            MarkdownDocument::from_file("./test/tables_separated_with_rawblock.docx");
+            MarkdownDocument::from_file("./test/tables_separated_with_rawblock.docx").unwrap();
         let markdown = markdown_doc.to_markdown(false);
         assert_eq!(markdown_pandoc, markdown);
     }
